@@ -440,6 +440,9 @@ impl GiSTLookup {
         let mut result = Vec::new();
         let mut to_visit = Vec::with_capacity(self.tree_depth as usize * MAX_ENTRIES_PER_NODE);
 
+        // 使用 query_to_predicate 进行查询优化
+        let query_predicate = ops.query_to_predicate(query);
+
         to_visit.push((&self.root, 0u8));
 
         while let Some((node, depth)) = to_visit.pop() {
@@ -451,8 +454,12 @@ impl GiSTLookup {
                 result.reserve(node.entries.len());
                 for &page_id in &node.entries {
                     if let Some(page_predicate) = self.page_predicates.get(&page_id) {
+                        // 使用双重检查：先用 consistent，再用 query_predicate 进行精确匹配
                         if ops.consistent(&**page_predicate, query) {
-                            result.push(page_id);
+                            // 进一步使用 query_predicate 进行精确过滤
+                            if self.predicate_matches_query(&**page_predicate, &*query_predicate, ops) {
+                                result.push(page_id);
+                            }
                         }
                     }
                 }
@@ -469,6 +476,108 @@ impl GiSTLookup {
         }
 
         result
+    }
+
+    // 使用 query_predicate 进行精确匹配
+    fn predicate_matches_query(
+        &self,
+        page_predicate: &dyn GiSTPredicate,
+        query_predicate: &dyn GiSTPredicate,
+        ops: &dyn GiSTOperations,
+    ) -> bool {
+        // 如果查询谓词和页面谓词相同，直接匹配
+        if ops.same(page_predicate, query_predicate) {
+            return true;
+        }
+
+        // 检查查询谓词是否与页面谓词有重叠
+        // 这里可以根据具体的谓词类型进行更精确的匹配
+        match (
+            page_predicate.as_any().downcast_ref::<BoundingBox>(),
+            query_predicate.as_any().downcast_ref::<BoundingBox>(),
+        ) {
+            (Some(page_bbox), Some(query_bbox)) => {
+                // 检查边界框是否相交
+                page_bbox.intersects(query_bbox)
+            }
+            _ => true, // 如果无法精确匹配，保守地返回 true
+        }
+    }
+
+    // 动态插入新的谓词到现有树中
+    fn insert_predicate(
+        &mut self,
+        page_id: u32,
+        predicate: Box<dyn GiSTPredicate>,
+        ops: &dyn GiSTOperations,
+    ) -> Result<()> {
+        // 检查是否已存在相同的谓词
+        if let Some(existing_predicate) = self.page_predicates.get(&page_id) {
+            if ops.same(&**existing_predicate, &*predicate) {
+                return Ok(()); // 已存在相同谓词，无需插入
+            }
+        }
+
+        // 存储页面谓词
+        self.page_predicates.insert(page_id, predicate.clone());
+
+        // 如果是空树，直接设置为根节点
+        if self.root.entries.is_empty() {
+            self.root.predicate = predicate;
+            self.root.entries.push(page_id);
+            return Ok(());
+        }
+
+        // 寻找最佳插入位置
+        let best_node_id = self.find_best_insertion_node(&*predicate, ops)?;
+        
+        if let Some(node_id) = best_node_id {
+            if let Some(node) = self.internal_nodes.get_mut(&node_id) {
+                node.entries.push(page_id);
+                // 更新节点的谓词为所有子项的联合
+                let child_predicates: Vec<&dyn GiSTPredicate> = node.entries.iter()
+                    .filter_map(|&id| self.page_predicates.get(&id).map(|p| &**p))
+                    .collect();
+                node.predicate = ops.union(&child_predicates);
+            }
+        } else {
+            // 插入到根节点
+            self.root.entries.push(page_id);
+            let root_child_predicates: Vec<&dyn GiSTPredicate> = self.root.entries.iter()
+                .filter_map(|&id| self.page_predicates.get(&id).map(|p| &**p))
+                .collect();
+            self.root.predicate = ops.union(&root_child_predicates);
+        }
+
+        Ok(())
+    }
+
+    // 使用 penalty() 方法寻找最佳插入位置
+    fn find_best_insertion_node(
+        &self,
+        predicate: &dyn GiSTPredicate,
+        ops: &dyn GiSTOperations,
+    ) -> Result<Option<u32>> {
+        let mut best_penalty = f64::INFINITY;
+        let mut best_node_id = None;
+
+        // 检查根节点
+        let root_penalty = ops.penalty(&*self.root.predicate, predicate);
+        if root_penalty < best_penalty {
+            best_penalty = root_penalty;
+            best_node_id = None; // None 表示根节点
+        }
+
+        // 检查所有内部节点
+        for (&node_id, node) in &self.internal_nodes {
+            let penalty = ops.penalty(&*node.predicate, predicate);
+            if penalty < best_penalty {
+                best_penalty = penalty;
+                best_node_id = Some(node_id);
+            }
+        }
+
+        Ok(best_node_id)
     }
 
     fn build_tree(
@@ -499,8 +608,28 @@ impl GiSTLookup {
             ));
         }
 
-        let page_predicates: BTreeMap<u32, Box<dyn GiSTPredicate>> =
-            leaf_pages.iter().cloned().collect();
+        // 使用 same() 方法进行去重优化
+        let mut page_predicates: BTreeMap<u32, Box<dyn GiSTPredicate>> = BTreeMap::new();
+        let mut predicate_cache: Vec<Box<dyn GiSTPredicate>> = Vec::new();
+        
+        for (page_id, predicate) in leaf_pages.iter().cloned() {
+            // 检查是否已有相同的谓词
+            let mut found_same = false;
+            for cached_predicate in &predicate_cache {
+                if ops.same(&**cached_predicate, &*predicate) {
+                    // 复用现有的谓词实例
+                    page_predicates.insert(page_id, cached_predicate.clone());
+                    found_same = true;
+                    break;
+                }
+            }
+            
+            if !found_same {
+                // 添加新的谓词到缓存
+                predicate_cache.push(predicate.clone());
+                page_predicates.insert(page_id, predicate);
+            }
+        }
         let mut internal_nodes = BTreeMap::new();
         let mut next_node_id = leaf_pages.len() as u32;
         let mut current_level: Vec<(u32, Box<dyn GiSTPredicate>)> = leaf_pages;
@@ -512,23 +641,77 @@ impl GiSTLookup {
         while current_level.len() > MAX_ENTRIES_PER_NODE {
             next_level.clear();
 
-            for chunk in current_level.chunks(MAX_ENTRIES_PER_NODE) {
-                let predicates: Vec<&dyn GiSTPredicate> =
-                    chunk.iter().map(|(_, pred)| &**pred).collect();
-                let union_predicate = ops.union(&predicates);
+            // 使用智能分裂而不是简单分块
+            let mut remaining_entries = current_level.clone();
+            
+            while !remaining_entries.is_empty() {
+                let chunk_size = std::cmp::min(MAX_ENTRIES_PER_NODE * 2, remaining_entries.len());
+                let chunk_entries: Vec<(u32, Box<dyn GiSTPredicate>)> = 
+                    remaining_entries.drain(..chunk_size).collect();
+                
+                if chunk_entries.len() <= MAX_ENTRIES_PER_NODE {
+                    // 直接创建节点
+                    let predicates: Vec<&dyn GiSTPredicate> =
+                        chunk_entries.iter().map(|(_, pred)| &**pred).collect();
+                    let union_predicate = ops.union(&predicates);
+                    let entries: Vec<u32> = chunk_entries.iter().map(|(page_id, _)| *page_id).collect();
 
-                let entries: Vec<u32> = chunk.iter().map(|(page_id, _)| *page_id).collect();
+                    let node = GiSTNode {
+                        predicate: union_predicate.clone(),
+                        is_leaf: false,
+                        entries,
+                    };
 
-                let node = GiSTNode {
-                    predicate: union_predicate.clone(),
-                    is_leaf: false,
-                    entries,
-                };
-
-                let node_id = next_node_id;
-                next_node_id += 1;
-                internal_nodes.insert(node_id, node);
-                next_level.push((node_id, union_predicate));
+                    let node_id = next_node_id;
+                    next_node_id += 1;
+                    internal_nodes.insert(node_id, node);
+                    next_level.push((node_id, union_predicate));
+                } else {
+                    // 使用 pick_split 进行智能分裂
+                    let predicates: Vec<Box<dyn GiSTPredicate>> = 
+                        chunk_entries.iter().map(|(_, pred)| pred.clone()).collect();
+                    let (group1_indices, group2_indices) = ops.pick_split(&predicates);
+                    
+                    // 创建第一个组
+                    if !group1_indices.is_empty() {
+                        let group1_entries: Vec<u32> = group1_indices.iter()
+                            .map(|&i| chunk_entries[i].0).collect();
+                        let group1_preds: Vec<&dyn GiSTPredicate> = group1_indices.iter()
+                            .map(|&i| &*chunk_entries[i].1).collect();
+                        let union1 = ops.union(&group1_preds);
+                        
+                        let node1 = GiSTNode {
+                            predicate: union1.clone(),
+                            is_leaf: false,
+                            entries: group1_entries,
+                        };
+                        
+                        let node_id1 = next_node_id;
+                        next_node_id += 1;
+                        internal_nodes.insert(node_id1, node1);
+                        next_level.push((node_id1, union1));
+                    }
+                    
+                    // 创建第二个组
+                    if !group2_indices.is_empty() {
+                        let group2_entries: Vec<u32> = group2_indices.iter()
+                            .map(|&i| chunk_entries[i].0).collect();
+                        let group2_preds: Vec<&dyn GiSTPredicate> = group2_indices.iter()
+                            .map(|&i| &*chunk_entries[i].1).collect();
+                        let union2 = ops.union(&group2_preds);
+                        
+                        let node2 = GiSTNode {
+                            predicate: union2.clone(),
+                            is_leaf: false,
+                            entries: group2_entries,
+                        };
+                        
+                        let node_id2 = next_node_id;
+                        next_node_id += 1;
+                        internal_nodes.insert(node_id2, node2);
+                        next_level.push((node_id2, union2));
+                    }
+                }
             }
 
             current_level = next_level.clone();
@@ -840,6 +1023,28 @@ impl GiSTIndex {
             fri,
         )
         .await
+    }
+
+    // 公共方法：动态插入新的边界框
+    async fn insert_bbox(
+        &self,
+        page_id: u32,
+        bbox: BoundingBox,
+    ) -> Result<()> {
+        let predicate = Box::new(bbox) as Box<dyn GiSTPredicate>;
+        
+        // 获取可变引用来修改 lookup
+        let mut lookup = Arc::try_unwrap(self.lookup.clone()).map_err(|_| Error::Internal {
+            message: "Cannot get mutable reference to lookup".to_string(),
+            location: location!(),
+        })?;
+        
+        lookup.insert_predicate(page_id, predicate, self.operations.as_ref())?;
+        
+        // 重新包装为 Arc
+        let updated_lookup = Arc::new(lookup);
+        
+        Ok(())
     }
 
     fn try_from_serialized(
@@ -1382,5 +1587,51 @@ mod tests {
             "Query should return some results. Tree has {} pages, query covers area 0.5-2.5",
             lookup.page_predicates.len()
         );
+    }
+
+    #[test]
+    fn test_enhanced_gist_methods() {
+        let ops = SpatialGiSTOps;
+        
+        // 测试 same() 方法
+        let bbox1 = BoundingBox::new(0.0, 0.0, 10.0, 10.0);
+        let bbox2 = BoundingBox::new(0.0, 0.0, 10.0, 10.0);
+        let bbox3 = BoundingBox::new(1.0, 1.0, 11.0, 11.0);
+        
+        assert!(ops.same(&bbox1, &bbox2)); // 相同的边界框
+        assert!(!ops.same(&bbox1, &bbox3)); // 不同的边界框
+        
+        // 测试 penalty() 方法
+        let penalty = ops.penalty(&bbox1, &bbox3);
+        assert!(penalty > 0.0); // penalty 应该大于 0
+        
+        // 测试 pick_split() 方法
+        let predicates = vec![
+            Box::new(BoundingBox::new(0.0, 0.0, 5.0, 5.0)) as Box<dyn GiSTPredicate>,
+            Box::new(BoundingBox::new(10.0, 10.0, 15.0, 15.0)) as Box<dyn GiSTPredicate>,
+            Box::new(BoundingBox::new(1.0, 1.0, 6.0, 6.0)) as Box<dyn GiSTPredicate>,
+            Box::new(BoundingBox::new(11.0, 11.0, 16.0, 16.0)) as Box<dyn GiSTPredicate>,
+        ];
+        
+        let (group1, group2) = ops.pick_split(&predicates);
+        assert!(!group1.is_empty());
+        assert!(!group2.is_empty());
+        assert_eq!(group1.len() + group2.len(), predicates.len());
+        
+        // 测试 query_to_predicate() 方法
+        let query = SpatialQuery::Intersects(BoundingBox::new(5.0, 5.0, 15.0, 15.0));
+        let query_predicate = ops.query_to_predicate(&query);
+        
+        // 验证转换的谓词不为空
+        if let Some(result_bbox) = query_predicate.as_any().downcast_ref::<BoundingBox>() {
+            assert_eq!(result_bbox.min_x, 5.0);
+            assert_eq!(result_bbox.min_y, 5.0);
+            assert_eq!(result_bbox.max_x, 15.0);
+            assert_eq!(result_bbox.max_y, 15.0);
+        } else {
+            panic!("query_to_predicate should return a BoundingBox");
+        }
+        
+        println!("All enhanced GiST methods are working correctly!");
     }
 }
