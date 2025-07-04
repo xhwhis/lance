@@ -80,6 +80,14 @@ trait GiSTOperations: Send + Sync + std::fmt::Debug + DeepSizeOf {
     fn consistent(&self, predicate: &dyn GiSTPredicate, query: &dyn GiSTQuery) -> bool;
 
     fn union(&self, predicates: &[&dyn GiSTPredicate]) -> Box<dyn GiSTPredicate>;
+
+    fn same(&self, predicate: &dyn GiSTPredicate, other: &dyn GiSTPredicate) -> bool;
+
+    fn penalty(&self, existing: &dyn GiSTPredicate, new: &dyn GiSTPredicate) -> f64;
+
+    fn pick_split(&self, entries: &[Box<dyn GiSTPredicate>]) -> (Vec<usize>, Vec<usize>);
+
+    fn query_to_predicate(&self, query: &dyn GiSTQuery) -> Box<dyn GiSTPredicate>;
 }
 
 #[derive(Debug, DeepSizeOf, PartialEq, Clone)]
@@ -111,7 +119,19 @@ impl BoundingBox {
         }
     }
 
+    fn intersects(&self, other: &Self) -> bool {
+        self.min_x <= other.max_x
+            && self.max_x >= other.min_x
+            && self.min_y <= other.max_y
+            && self.max_y >= other.min_y
+    }
 
+    fn contains(&self, other: &Self) -> bool {
+        self.min_x <= other.min_x
+            && self.max_x >= other.max_x
+            && self.min_y <= other.min_y
+            && self.max_y >= other.max_y
+    }
 
     fn area(&self) -> f64 {
         (self.max_x - self.min_x) * (self.max_y - self.min_y)
@@ -232,10 +252,141 @@ impl GiSTOperations for SpatialGiSTOps {
         Box::new(BoundingBox::new(min_x, min_y, max_x, max_y))
     }
 
+    fn same(&self, predicate: &dyn GiSTPredicate, other: &dyn GiSTPredicate) -> bool {
+        match (
+            predicate.as_any().downcast_ref::<BoundingBox>(),
+            other.as_any().downcast_ref::<BoundingBox>(),
+        ) {
+            (Some(bbox1), Some(bbox2)) => {
+                (bbox1.min_x - bbox2.min_x).abs() < f64::EPSILON
+                    && (bbox1.min_y - bbox2.min_y).abs() < f64::EPSILON
+                    && (bbox1.max_x - bbox2.max_x).abs() < f64::EPSILON
+                    && (bbox1.max_y - bbox2.max_y).abs() < f64::EPSILON
+            }
+            _ => false,
+        }
+    }
 
+    fn penalty(&self, existing: &dyn GiSTPredicate, new: &dyn GiSTPredicate) -> f64 {
+        match (
+            existing.as_any().downcast_ref::<BoundingBox>(),
+            new.as_any().downcast_ref::<BoundingBox>(),
+        ) {
+            (Some(existing_bbox), Some(new_bbox)) => {
+                let union_min_x = existing_bbox.min_x.min(new_bbox.min_x);
+                let union_min_y = existing_bbox.min_y.min(new_bbox.min_y);
+                let union_max_x = existing_bbox.max_x.max(new_bbox.max_x);
+                let union_max_y = existing_bbox.max_y.max(new_bbox.max_y);
+
+                let union_area = (union_max_x - union_min_x) * (union_max_y - union_min_y);
+                let existing_area = (existing_bbox.max_x - existing_bbox.min_x)
+                    * (existing_bbox.max_y - existing_bbox.min_y);
+
+                union_area - existing_area
+            }
+            _ => f64::INFINITY,
+        }
+    }
+
+    fn pick_split(&self, entries: &[Box<dyn GiSTPredicate>]) -> (Vec<usize>, Vec<usize>) {
+        if entries.len() <= 2 {
+            return (vec![0], if entries.len() > 1 { vec![1] } else { vec![] });
+        }
+
+        let bbox_data: Vec<(usize, f64, f64, f64, f64)> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, pred)| {
+                pred.as_any()
+                    .downcast_ref::<BoundingBox>()
+                    .map(|bbox| (i, bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y))
+            })
+            .collect();
+
+        if bbox_data.len() <= 2 {
+            return (vec![0], if bbox_data.len() > 1 { vec![1] } else { vec![] });
+        }
+
+        let (seed1, seed2) = self.find_optimal_seeds(&bbox_data);
+        self.distribute_entries(entries, seed1, seed2)
+    }
+
+    fn query_to_predicate(&self, query: &dyn GiSTQuery) -> Box<dyn GiSTPredicate> {
+        if let Some(spatial_query) = query.as_any_query().as_any().downcast_ref::<SpatialQuery>() {
+            match spatial_query {
+                SpatialQuery::Intersects(bbox) | SpatialQuery::Contains(bbox) => {
+                    Box::new(bbox.clone())
+                }
+            }
+        } else {
+            Box::new(BoundingBox::new(0.0, 0.0, 0.0, 0.0))
+        }
+    }
 }
 
+impl SpatialGiSTOps {
+    fn find_optimal_seeds(&self, bbox_data: &[(usize, f64, f64, f64, f64)]) -> (usize, usize) {
+        let mut max_separation = f64::NEG_INFINITY;
+        let mut seed1 = 0;
+        let mut seed2 = 1;
 
+        for i in 0..bbox_data.len() {
+            let (_, min_x1, min_y1, max_x1, max_y1) = unsafe { *bbox_data.get_unchecked(i) };
+            let area1 = (max_x1 - min_x1) * (max_y1 - min_y1);
+
+            for j in (i + 1)..bbox_data.len() {
+                let (_, min_x2, min_y2, max_x2, max_y2) = unsafe { *bbox_data.get_unchecked(j) };
+                let area2 = (max_x2 - min_x2) * (max_y2 - min_y2);
+
+                let union_area = (max_x1.max(max_x2) - min_x1.min(min_x2))
+                    * (max_y1.max(max_y2) - min_y1.min(min_y2));
+                let separation = union_area - area1 - area2;
+
+                if separation > max_separation {
+                    max_separation = separation;
+                    seed1 = bbox_data[i].0;
+                    seed2 = bbox_data[j].0;
+                }
+            }
+        }
+        (seed1, seed2)
+    }
+
+    fn distribute_entries(
+        &self,
+        entries: &[Box<dyn GiSTPredicate>],
+        seed1: usize,
+        seed2: usize,
+    ) -> (Vec<usize>, Vec<usize>) {
+        let mut group1 = Vec::with_capacity(entries.len() / 2 + 1);
+        let mut group2 = Vec::with_capacity(entries.len() / 2 + 1);
+
+        group1.push(seed1);
+        group2.push(seed2);
+
+        let mut union1 = entries[seed1].clone();
+        let mut union2 = entries[seed2].clone();
+
+        for i in 0..entries.len() {
+            if i == seed1 || i == seed2 {
+                continue;
+            }
+
+            let penalty1 = self.penalty(union1.as_ref(), entries[i].as_ref());
+            let penalty2 = self.penalty(union2.as_ref(), entries[i].as_ref());
+
+            if penalty1 <= penalty2 && group1.len() < entries.len() - 1 {
+                group1.push(i);
+                union1 = self.union(&[union1.as_ref(), entries[i].as_ref()]);
+            } else {
+                group2.push(i);
+                union2 = self.union(&[union2.as_ref(), entries[i].as_ref()]);
+            }
+        }
+
+        (group1, group2)
+    }
+}
 
 #[derive(Debug)]
 struct GiSTNode {
@@ -478,7 +629,22 @@ impl GiSTIndex {
         }
     }
 
-
+    fn new_spatial(
+        lookup: GiSTLookup,
+        store: Arc<dyn IndexStore>,
+        sub_index: Arc<dyn BTreeSubIndex>,
+        batch_size: u64,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Self {
+        Self::new(
+            lookup,
+            Arc::new(SpatialGiSTOps),
+            store,
+            sub_index,
+            batch_size,
+            fri,
+        )
+    }
 
     async fn lookup_page(
         &self,
@@ -633,9 +799,48 @@ impl GiSTIndex {
         Ok(SearchResult::Exact(overall_row_ids))
     }
 
+    async fn build_index(
+        predicates: Vec<(u32, Box<dyn GiSTPredicate>)>,
+        ops: &dyn GiSTOperations,
+        store: Arc<dyn IndexStore>,
+        sub_index: Arc<dyn BTreeSubIndex>,
+        batch_size: u64,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
+        let lookup = GiSTLookup::build_tree(predicates, ops)?;
 
+        Ok(Self::new(
+            lookup,
+            Arc::new(SpatialGiSTOps),
+            store,
+            sub_index,
+            batch_size,
+            fri,
+        ))
+    }
 
+    async fn build_from_bboxes(
+        bboxes: Vec<(u32, BoundingBox)>,
+        store: Arc<dyn IndexStore>,
+        sub_index: Arc<dyn BTreeSubIndex>,
+        batch_size: u64,
+        fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
+        let predicates: Vec<(u32, Box<dyn GiSTPredicate>)> = bboxes
+            .into_iter()
+            .map(|(id, bbox)| (id, Box::new(bbox) as Box<dyn GiSTPredicate>))
+            .collect();
 
+        Self::build_index(
+            predicates,
+            &SpatialGiSTOps,
+            store,
+            sub_index,
+            batch_size,
+            fri,
+        )
+        .await
+    }
 
     fn try_from_serialized(
         data: RecordBatch,
