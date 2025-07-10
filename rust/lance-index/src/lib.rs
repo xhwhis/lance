@@ -91,6 +91,8 @@ pub enum IndexType {
 
     FragmentReuse = 6,
 
+    GiST = 7, // GiST
+
     // 100+ and up for vector index.
     /// Flat vector index.
     Vector = 100, // Legacy vector index, alias to IvfPq
@@ -111,6 +113,7 @@ impl std::fmt::Display for IndexType {
             Self::Inverted => write!(f, "Inverted"),
             Self::NGram => write!(f, "NGram"),
             Self::FragmentReuse => write!(f, "FragmentReuse"),
+            Self::GiST => write!(f, "GiST"),
             Self::Vector | Self::IvfPq => write!(f, "IVF_PQ"),
             Self::IvfFlat => write!(f, "IVF_FLAT"),
             Self::IvfSq => write!(f, "IVF_SQ"),
@@ -132,6 +135,7 @@ impl TryFrom<i32> for IndexType {
             v if v == Self::LabelList as i32 => Ok(Self::LabelList),
             v if v == Self::NGram as i32 => Ok(Self::NGram),
             v if v == Self::Inverted as i32 => Ok(Self::Inverted),
+            v if v == Self::GiST as i32 => Ok(Self::GiST),
             v if v == Self::Vector as i32 => Ok(Self::Vector),
             v if v == Self::IvfFlat as i32 => Ok(Self::IvfFlat),
             v if v == Self::IvfSq as i32 => Ok(Self::IvfSq),
@@ -157,6 +161,7 @@ impl IndexType {
                 | Self::LabelList
                 | Self::Inverted
                 | Self::NGram
+                | Self::GiST
         )
     }
 
@@ -187,6 +192,7 @@ impl IndexType {
             Self::Inverted => 0,
             Self::NGram => 0,
             Self::FragmentReuse => 0,
+            Self::GiST => 0,
 
             // for now all vector indices are built by the same builder,
             // so they share the same version.

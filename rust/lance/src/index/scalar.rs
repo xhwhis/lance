@@ -21,6 +21,7 @@ use lance_core::datatypes::Field;
 use lance_core::{Error, Result};
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
 use lance_index::metrics::MetricsCollector;
+use lance_index::scalar::gist::GiSTIndex;
 use lance_index::scalar::{
     btree::DEFAULT_BTREE_BATCH_SIZE, inverted::tokenizer::InvertedIndexParams,
 };
@@ -385,6 +386,10 @@ pub async fn open_scalar_index(
         ScalarIndexType::BTree => {
             let btree_index = BTreeIndex::load(index_store, fri).await?;
             Ok(btree_index as Arc<dyn ScalarIndex>)
+        }
+        ScalarIndexType::GiST => {
+            let gist_index = GiSTIndex::load(index_store, fri).await?;
+            Ok(gist_index as Arc<dyn ScalarIndex>)
         }
     }
 }

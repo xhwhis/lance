@@ -29,6 +29,7 @@ deepsize.workspace = true
 dirs.workspace = true
 fst.workspace = true
 futures.workspace = true
+geos = { version = "10.0.0", features = ["v3_11_0"] }
 half.workspace = true
 itertools.workspace = true
 jieba-rs = { workspace = true, optional = true }
