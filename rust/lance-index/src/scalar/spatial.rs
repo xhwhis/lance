@@ -1117,4 +1117,50 @@ mod tests {
             panic!("query_to_predicate should return a BoundingBox");
         }
     }
+
+    #[test]
+    fn test_penalty_calculation() {
+        let ops = SpatialGiSTOps;
+        let existing = BoundingBox::new(0.0, 0.0, 10.0, 10.0);
+        let new1 = BoundingBox::new(5.0, 5.0, 15.0, 15.0);
+        let new2 = BoundingBox::new(10.0, 10.0, 20.0, 20.0);
+
+        let penalty1 = ops.penalty(&existing, &new1);
+        let penalty2 = ops.penalty(&existing, &new2);
+
+        assert!(penalty1 > 0.0);
+        assert!(penalty2 > penalty1);
+    }
+
+    #[test]
+    fn test_union_multiple_boxes() {
+        let ops = SpatialGiSTOps;
+        let bbox1 = BoundingBox::new(0.0, 0.0, 5.0, 5.0);
+        let bbox2 = BoundingBox::new(3.0, 3.0, 7.0, 7.0);
+        let bbox3 = BoundingBox::new(6.0, 6.0, 10.0, 10.0);
+
+        let predicates: Vec<&dyn GiSTPredicate> = vec![&bbox1, &bbox2, &bbox3];
+        let union = ops.union(&predicates);
+
+        if let Some(union_bbox) = union.as_any().downcast_ref::<BoundingBox>() {
+            assert_eq!(union_bbox.min_x, 0.0);
+            assert_eq!(union_bbox.min_y, 0.0);
+            assert_eq!(union_bbox.max_x, 10.0);
+            assert_eq!(union_bbox.max_y, 10.0);
+        } else {
+            panic!("Union should return a BoundingBox");
+        }
+    }
+
+    #[test]
+    fn test_intersects_multiple() {
+        let bbox1 = BoundingBox::new(0.0, 0.0, 10.0, 10.0);
+        let bbox2 = BoundingBox::new(5.0, 5.0, 15.0, 15.0);
+        let bbox3 = BoundingBox::new(20.0, 20.0, 30.0, 30.0);
+
+        assert!(bbox1.intersects(&bbox2));
+        assert!(!bbox1.intersects(&bbox3));
+        assert!(bbox2.intersects(&bbox1));
+        assert!(!bbox2.intersects(&bbox3));
+    }
 }
