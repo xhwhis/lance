@@ -1164,3 +1164,70 @@ mod tests {
         assert!(!bbox2.intersects(&bbox3));
     }
 }
+
+#[tokio::test]
+async fn test_gist_index_usage() {
+    use lance::dataset::{Dataset, WriteParams};
+    use lance::index::IndexType;
+    use lance::io::ObjectStore;
+    use object_store::path::Path;
+    use tempfile::tempdir;
+
+    let tempdir = tempdir().unwrap();
+    let uri = tempdir.path().to_str().unwrap();
+    let store = ObjectStore::local();
+    let base = Path::parse(uri).unwrap();
+
+    // Create sample data with bounding boxes
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt32, false),
+        Field::new("bbox", DataType::Struct(Fields::from(vec![
+            Field::new("min_x", DataType::Float64, false),
+            Field::new("min_y", DataType::Float64, false),
+            Field::new("max_x", DataType::Float64, false),
+            Field::new("max_y", DataType::Float64, false),
+        ])), false),
+    ]));
+
+    let bboxes = vec![
+        BoundingBox::new(0.0, 0.0, 2.0, 2.0),
+        BoundingBox::new(1.0, 1.0, 3.0, 3.0),
+        BoundingBox::new(3.0, 3.0, 5.0, 5.0),
+        BoundingBox::new(4.0, 4.0, 6.0, 6.0),
+    ];
+
+    let min_x = Float64Array::from(bboxes.iter().map(|b| b.min_x).collect::<Vec<_>>());
+    let min_y = Float64Array::from(bboxes.iter().map(|b| b.min_y).collect::<Vec<_>>());
+    let max_x = Float64Array::from(bboxes.iter().map(|b| b.max_x).collect::<Vec<_>>());
+    let max_y = Float64Array::from(bboxes.iter().map(|b| b.max_y).collect::<Vec<_>>());
+    let ids = UInt32Array::from(vec![0, 1, 2, 3]);
+
+    let struct_array = StructArray::try_new(
+        schema.field("bbox").unwrap().fields().clone(),
+        vec![Arc::new(min_x) as ArrayRef, Arc::new(min_y), Arc::new(max_x), Arc::new(max_y)],
+        None,
+    ).unwrap();
+
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(struct_array)]).unwrap();
+
+    Dataset::write(&mut [batch].iter().cloned(), uri, Some(WriteParams::default())).await.unwrap();
+
+    let dataset = Dataset::open(uri).await.unwrap();
+    dataset.create_index(&["bbox"], IndexType::Scalar, None, &ScalarIndexParams::default(), true).await.unwrap();
+
+    // Test intersects query
+    let query_bbox = BoundingBox::new(2.5, 2.5, 4.5, 4.5);
+    let filter = format!("bbox.min_x <= {} AND bbox.max_x >= {} AND bbox.min_y <= {} AND bbox.max_y >= {}",
+                        query_bbox.max_x, query_bbox.min_x, query_bbox.max_y, query_bbox.min_y);
+    let results = dataset.scan().filter(&filter).unwrap().try_into_batch().await.unwrap();
+    let result_ids: Vec<u32> = results.column_by_name("id").unwrap().as_primitive::<UInt32Type>().values().to_vec();
+    assert_eq!(result_ids, vec![2, 3]);
+
+    // Test contains query
+    let contain_bbox = BoundingBox::new(1.5, 1.5, 2.5, 2.5);
+    let contain_filter = format!("bbox.min_x <= {} AND bbox.max_x >= {} AND bbox.min_y <= {} AND bbox.max_y >= {}",
+                                 contain_bbox.min_x, contain_bbox.max_x, contain_bbox.min_y, contain_bbox.max_y);
+    let contain_results = dataset.scan().filter(&contain_filter).unwrap().try_into_batch().await.unwrap();
+    let contain_ids: Vec<u32> = contain_results.column_by_name("id").unwrap().as_primitive::<UInt32Type>().values().to_vec();
+    assert_eq!(contain_ids, vec![1]);
+}
